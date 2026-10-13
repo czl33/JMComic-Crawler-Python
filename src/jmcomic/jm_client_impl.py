@@ -1,5 +1,7 @@
+from copy import deepcopy
 from threading import Lock
 
+from .jm_task_context import bind_jm_task_context
 from .jm_client_interface import *
 
 
@@ -15,6 +17,7 @@ class AbstractJmClient(
                  postman: Postman,
                  domain_list: List[str],
                  retry_times=0,
+                 domain_retry_strategy=None,
                  ):
         """
         创建JM客户端
@@ -26,9 +29,12 @@ class AbstractJmClient(
         super().__init__(postman)
         self.retry_times = retry_times
         self.domain_list = domain_list
-        self.domain_retry_strategy = None
+        self.domain_retry_strategy = domain_retry_strategy
         self.CLIENT_CACHE = None
         self._username = None  # help for favorite_folder method
+        self._user_id = None  # help for check_in / get_daily method
+        if domain_retry_strategy:
+            domain_retry_strategy(self)
         self.enable_cache()
         self.after_init()
 
@@ -53,6 +59,7 @@ class AbstractJmClient(
                            domain_index=0,
                            retry_count=0,
                            is_image=False,
+                           _retry_errors=None,
                            **kwargs,
                            ):
         """
@@ -77,8 +84,12 @@ class AbstractJmClient(
                                               **kwargs,
                                               )
 
+        if _retry_errors is None:
+            _retry_errors = []
+
         if domain_index >= len(self.domain_list):
-            return self.fallback(request, url, domain_index, retry_count, is_image, **kwargs)
+            return self.fallback(request, url, domain_index, retry_count, is_image,
+                                 retry_errors=_retry_errors, **kwargs)
 
         url_backup = url
 
@@ -114,11 +125,19 @@ class AbstractJmClient(
                 raise e
 
             self.before_retry(e, kwargs, retry_count, url)
+            _retry_errors.append({
+                'domain': self.domain_list[domain_index] if url_backup.startswith('/') else None,
+                'url': url,
+                'retry': retry_count,
+                'error': e,
+            })
 
         if retry_count < self.retry_times:
-            return self.request_with_retry(request, url_backup, domain_index, retry_count + 1, is_image, **kwargs)
+            return self.request_with_retry(request, url_backup, domain_index, retry_count + 1, is_image,
+                                           _retry_errors, **kwargs)
         else:
-            return self.request_with_retry(request, url_backup, domain_index + 1, 0, is_image, **kwargs)
+            return self.request_with_retry(request, url_backup, domain_index + 1, 0, is_image,
+                                           _retry_errors, **kwargs)
 
     # noinspection PyMethodMayBeStatic
     def raise_if_resp_should_retry(self, resp, is_image):
@@ -182,10 +201,10 @@ class AbstractJmClient(
 
                 result = cache.get(key, sentinel)
                 if result is not sentinel:
-                    return result
+                    return deepcopy(result) if isinstance(result, DetailEntity) else result
 
                 result = func(*args, **kwargs)
-                cache[key] = result
+                cache[key] = deepcopy(result) if isinstance(result, DetailEntity) else result
                 return result
 
             setattr(self, func_name, cache_wrapper)
@@ -206,10 +225,14 @@ class AbstractJmClient(
         self.domain_list = domain_list
 
     # noinspection PyUnusedLocal
-    def fallback(self, request, url, domain_index, retry_count, is_image, **kwargs):
+    def fallback(self, request, url, domain_index, retry_count, is_image, retry_errors=None, **kwargs):
         msg = f"请求重试全部失败: [{url}], {self.domain_list}"
         jm_log('req.fallback', msg)
-        ExceptionTool.raises(msg, {}, RequestRetryAllFailException)
+        ExceptionTool.raises(
+            msg,
+            {ExceptionTool.CONTEXT_KEY_RETRY_ERRORS: retry_errors or []},
+            RequestRetryAllFailException,
+        )
 
     # noinspection PyMethodMayBeStatic
     def append_params_to_url(self, url, params):
@@ -237,19 +260,19 @@ class JmHtmlClient(AbstractJmClient):
 
     API_SEARCH = '/search/photos'
     API_CATEGORY = '/albums'
+    API_ALBUM_PAGINATION = '/ajax/album_pagination'
+    API_FORUM = '/ajax/forum_more'
 
     def add_favorite_album(self,
                            album_id,
                            folder_id='0',
                            ):
-        data = {
-            'album_id': album_id,
-            'fid': folder_id,
-        }
-
-        resp = self.get_jm_html(
+        resp = self.post(
             '/ajax/favorite_album',
-            data=data,
+            data={
+                'album_id': str(album_id),
+                'fid': str(folder_id),
+            },
         )
 
         res = resp.json()
@@ -266,6 +289,30 @@ class JmHtmlClient(AbstractJmClient):
 
         return resp
 
+    def delete_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              ):
+        resp = self.post(
+            '/ajax/delete_favorite_album',
+            data={
+                'album_id': str(album_id),
+            },
+        )
+
+        res = resp.json()
+
+        if res['status'] != 1:
+            msg = parse_unicode_escape_text(res['msg'])
+            error_msg = PatternTool.match_or_default(msg, JmcomicText.pattern_ajax_favorite_msg, msg)
+
+            self.raise_request_error(
+                resp,
+                error_msg
+            )
+
+        return resp
+
     def get_album_detail(self, album_id) -> JmAlbumDetail:
         return self.fetch_detail_entity(album_id, 'album')
 
@@ -274,18 +321,15 @@ class JmHtmlClient(AbstractJmClient):
                          fetch_album=True,
                          fetch_scramble_id=True,
                          ) -> JmPhotoDetail:
-        photo = self.fetch_detail_entity(photo_id, 'photo')
+        photo: JmPhotoDetail = self.fetch_detail_entity(photo_id, 'photo')
 
         # 一并获取该章节的所处本子
-        # todo: 可优化，获取章节所在本子，其实不需要等待章节获取完毕后。
-        #  可以直接调用 self.get_album_detail(photo_id)，会重定向返回本子的HTML
-        # (had polished by FutureClientProxy)
-        if fetch_album is True:
+        if fetch_album:
             photo.from_album = self.get_album_detail(photo.album_id)
 
         return photo
 
-    def fetch_detail_entity(self, jmid, prefix):
+    def fetch_detail_entity(self, jmid, prefix) -> DetailType:
         # 参数校验
         jmid = JmcomicText.parse_to_jm_id(jmid)
 
@@ -298,6 +342,8 @@ class JmHtmlClient(AbstractJmClient):
 
         if prefix == 'photo':
             return JmcomicText.analyse_jm_photo_html(resp.text)
+
+        raise ValueError(f"不支持的 prefix 类型: {prefix}")
 
     def search(self,
                search_query: str,
@@ -330,9 +376,9 @@ class JmHtmlClient(AbstractJmClient):
         # 因为如果搜索的是禁漫车号，会直接跳转到本子详情页面
         if resp.redirect_count != 0 and '/album/' in resp.url:
             album = JmcomicText.analyse_jm_album_html(resp.text)
-            return JmSearchPage.wrap_single_album(album)
+            return JmSearchPage.wrap_single_album(album, page)
         else:
-            return JmPageTool.parse_html_to_search_page(resp.text)
+            return JmPageTool.parse_html_to_search_page(resp.text, page)
 
     @classmethod
     def build_search_url(cls, base: str, category: str, sub_category: Optional[str]):
@@ -373,7 +419,7 @@ class JmHtmlClient(AbstractJmClient):
             allow_redirects=True,
         )
 
-        return JmPageTool.parse_html_to_category_page(resp.text)
+        return JmPageTool.parse_html_to_category_page(resp.text, page)
 
     # -- 帐号管理 --
 
@@ -401,7 +447,12 @@ class JmHtmlClient(AbstractJmClient):
                          )
 
         if resp.status_code != 200:
-            ExceptionTool.raises_resp(f'登录失败，状态码为{resp.status_code}', resp)
+            self.raise_request_error(resp, f'登录失败，状态码为{resp.status_code}')
+
+        res = resp.json()
+        if res.get('status') != 1:
+            errors = res.get('errors') or [res.get('msg', '登录失败')]
+            self.raise_request_error(resp, f'登录失败：{errors[0]}')
 
         orig_cookies = self.get_meta_data('cookies') or {}
         new_cookies = dict(resp.cookies)
@@ -416,7 +467,7 @@ class JmHtmlClient(AbstractJmClient):
 
     def favorite_folder(self,
                         page=1,
-                        order_by=JmMagicConstants.ORDER_BY_LATEST,
+                        order_by=JmMagicConstants.ORDER_FF_FAVORITE_TIME,
                         folder_id='0',
                         username='',
                         ) -> JmFavoritePage:
@@ -433,7 +484,7 @@ class JmHtmlClient(AbstractJmClient):
             }
         )
 
-        return JmPageTool.parse_html_to_favorite_page(resp.text)
+        return JmPageTool.parse_html_to_favorite_page(resp.text, page)
 
     # noinspection PyTypeChecker
     def get_username_from_cookies(self) -> str:
@@ -442,6 +493,73 @@ class JmHtmlClient(AbstractJmClient):
         #     ExceptionTool.raises('未登录，无法获取到对应的用户名，请给favorite方法传入username参数')
         # 解析cookies，可能需要用到 phpserialize，比较麻烦，暂不实现
         pass
+
+    def get_or_fetch_daily_id(self, daily_id: str | None = None) -> str:
+        if daily_id is None:
+            resp_home = self.get_jm_html('/')
+            daily_id = JmcomicText.parse_daily_id(resp_home.text)
+            ExceptionTool.require_true(bool(daily_id), '未能从首页获取到 daily_id，请手动传入 daily_id 参数')
+        return str(daily_id)
+
+    def get_daily(self,
+                  user_id: str | None = None,
+                  daily_id: str | None = None
+                  ) -> JmJsonResp:
+        """
+        网页端获取每日签到信息与日历打卡记录。
+        返回值格式参考 JmUserClient.get_daily 文档。
+        :param user_id: 兼容参数，网页端不需要
+        :param daily_id: 如果外界提前获取了，可直接传递参数，使得本方法内部少一次网络请求查询。
+        :return: JmJsonResp
+        """
+        daily_id = self.get_or_fetch_daily_id(daily_id)
+        resp = self.get(
+            '/ajax/user_daily_event',
+            params={'daily_id': daily_id},
+        )
+        ret = JmJsonResp(resp)
+        ret.require_success()
+        return ret
+
+    def daily_checkin(self,
+                      daily_id: str | None = None,
+                      user_id: str | None = None,
+                      old_step: int = 1
+                      ) -> JmDailyCheckinResp:
+        """
+        网页端每日签到。
+        返回 JmDailyCheckinResp 对象：
+        - code=0 (或 status=0): 签到成功
+        - code=1 (或 status=1): 重复签到（今日已完成打卡）
+        - 其余失败情况直接抛出异常
+        :param daily_id: 打卡任务ID，未提供时会自动从首页提取
+        :param user_id: 兼容参数，网页端不需要
+        :param old_step: 连续签到天数阶段，默认为 1
+        :return: JmDailyCheckinResp
+        """
+        daily_id = self.get_or_fetch_daily_id(daily_id)
+        resp = self.post(
+            '/ajax/user_daily_sign',
+            data={
+                'daily_id': daily_id,
+                'oldStep': str(old_step),
+            },
+        )
+        if resp.status_code != 200:
+            self.raise_request_error(resp, f'签到请求失败，HTTP状态码: {resp.status_code}')
+
+        res = resp.json()
+        status = res.get('status')
+        msg = str(res.get('msg', ''))
+
+        if status == 1:
+            code = JmDailyCheckinResp.CODE_SUCCESS
+        elif status == 0 and any(kw in msg for kw in ('已完成打卡', '今天已经签到', '今日已完成', '已签到', '已打卡')):
+            code = JmDailyCheckinResp.CODE_ALREADY_CHECKED_IN
+        else:
+            self.raise_request_error(resp, f'签到失败：{msg or status}')
+
+        return JmDailyCheckinResp(resp, code, msg, res)
 
     def get_jm_html(self, url, require_200=True, **kwargs):
         """
@@ -476,12 +594,21 @@ class JmHtmlClient(AbstractJmClient):
         请求如果失败，统一由该方法抛出异常
         """
         if msg is None:
+            msg_tail = '' if JmModuleConfig.FLAG_DUMP_HTML_ON_REGEX_ERROR else ('，可通过设置 '
+                                                                                'JmModuleConfig.FLAG_DUMP_HTML_ON_REGEX_ERROR = '
+                                                                                'True 将响应文本保存到文件')
             msg = f"请求失败，" \
                   f"响应状态码为{resp.status_code}，" \
                   f"URL=[{resp.url}]，" \
                   + (f"响应文本=[{resp.text}]" if len(resp.text) < 200 else
-                     f'响应文本过长(len={len(resp.text)})，不打印'
+                     f'响应文本过长(len={len(resp.text)})，不打印{msg_tail}'
                      )
+
+            # 当 flag 开启时，将过长的响应文本持久化到文件，方便debug
+            if len(resp.text) >= 200 and JmModuleConfig.FLAG_DUMP_HTML_ON_REGEX_ERROR:
+                dump_path = ExceptionTool.dump_html_to_file(resp.text, msg)
+                if dump_path is not None:
+                    msg += f'\n已将响应文本持久化到文件: [{dump_path}]'
 
         ExceptionTool.raises_resp(msg, resp)
 
@@ -515,9 +642,51 @@ class JmHtmlClient(AbstractJmClient):
         resp = self.post('/ajax/album_comment', data=data)
 
         ret = JmAlbumCommentResp(resp)
+        ret.require_success()
         jm_log('album.comment', f'{video_id}: [{comment}] ← ({ret.model().cid})')
 
         return ret
+
+    def album_pagination(self,
+                         jm_id: str,
+                         page=1,
+                         series=1,
+                         with_ad_wcm=1,
+                         need_total=True,
+                         ) -> JmAlbumCommentPage:
+        resp = self.post(
+            self.API_ALBUM_PAGINATION,
+            data={
+                'video_id': JmcomicText.parse_to_jm_id(jm_id),
+                'page': page,
+                'series': series,
+                'with_ad_wcm': with_ad_wcm,
+            }
+        )
+
+        ret = JmJsonResp(resp)
+        ret.require_success()
+        comment_page = JmPageTool.parse_html_to_album_comment_page(ret.model(), page)
+        if need_total:
+            album = self.get_album_detail(jm_id)
+            comment_page.total = album.comment_count
+
+        return comment_page
+
+    def forum_pagination(self,
+                         page=1,
+                         with_ad_wcm=1,
+                         ) -> JmAlbumCommentPage:
+        resp = self.post(
+            self.API_FORUM,
+            data={
+                'page': page,
+                'with_ad_wcm': with_ad_wcm,
+            },
+        )
+        ret = JmJsonResp(resp)
+        ret.require_success()
+        return JmPageTool.parse_html_to_album_comment_page(ret.model(), page)
 
     @classmethod
     def require_resp_success_else_raise(cls, resp, url: str):
@@ -597,6 +766,9 @@ class JmApiClient(AbstractJmClient):
     API_CHAPTER = '/chapter'
     API_SCRAMBLE = '/chapter_view_template'
     API_FAVORITE = '/favorite'
+    API_FORUM = '/forum'
+    API_DAILY = '/daily'
+    API_DAILY_CHK = '/daily_chk'
 
     def search(self,
                search_query: str,
@@ -630,9 +802,9 @@ class JmApiClient(AbstractJmClient):
         data = resp.model_data
         if data.get('redirect_aid', None) is not None:
             aid = data.redirect_aid
-            return JmSearchPage.wrap_single_album(self.get_album_detail(aid))
+            return JmSearchPage.wrap_single_album(self.get_album_detail(aid), page)
 
-        return JmPageTool.parse_api_to_search_page(data)
+        return JmPageTool.parse_api_to_search_page(data, page)
 
     def categories_filter(self,
                           page: int,
@@ -656,7 +828,7 @@ class JmApiClient(AbstractJmClient):
 
         resp = self.req_api(self.append_params_to_url(self.API_CATEGORIES_FILTER, params))
 
-        return JmPageTool.parse_api_to_search_page(resp.model_data)
+        return JmPageTool.parse_api_to_search_page(resp.model_data, page)
 
     def get_album_detail(self, album_id) -> JmAlbumDetail:
         return self.fetch_detail_entity(album_id,
@@ -694,9 +866,19 @@ class JmApiClient(AbstractJmClient):
 
         return scramble_id
 
-    def fetch_detail_entity(self, jmid, clazz):
+    def fetch_detail_entity(self, jmid, clazz: Type[DetailType]) -> DetailType:
         """
-        请求实体类
+        Fetches a JM entity (album or chapter) by its JM ID and returns it as an instance of `clazz`.
+        
+        Parameters:
+            jmid (str | int): JM ID or value parseable to a JM ID.
+            clazz (type): Entity class to parse the response into (e.g., `JmAlbumDetail` or a chapter/detail class).
+        
+        Returns:
+            object: An instance of `clazz` populated from the API response data.
+        
+        Raises:
+            Exception: Raised via ExceptionTool.raise_missing if the API response lacks required data.
         """
         jmid = JmcomicText.parse_to_jm_id(jmid)
         url = self.API_ALBUM if issubclass(clazz, JmAlbumDetail) else self.API_CHAPTER
@@ -707,7 +889,7 @@ class JmApiClient(AbstractJmClient):
             })
         )
 
-        if resp.res_data.get('name') is None:
+        if not resp.encoded_data or resp.res_data.get('name') is None:
             ExceptionTool.raise_missing(resp, jmid)
 
         return JmApiAdaptTool.parse_entity(resp.res_data, clazz)
@@ -717,7 +899,7 @@ class JmApiClient(AbstractJmClient):
         请求scramble_id
         """
         photo_id: str = JmcomicText.parse_to_jm_id(photo_id)
-        resp = self.req_api(
+        resp = self.req_api(self.append_params_to_url(
             self.API_SCRAMBLE,
             params={
                 'id': photo_id,
@@ -726,7 +908,7 @@ class JmApiClient(AbstractJmClient):
                 'app_img_shunt': '1',
                 'express': 'off',
                 'v': time_stamp(),
-            },
+            }),
             require_success=False,
         )
 
@@ -762,55 +944,17 @@ class JmApiClient(AbstractJmClient):
 
     def setting(self) -> JmApiResp:
         """
-        禁漫app的setting请求，返回如下内容（resp.res_data）
-        {
-          "logo_path": "https://cdn-msp.jmapiproxy1.monster/media/logo/new_logo.png",
-          "main_web_host": "18-comic.work",
-          "img_host": "https://cdn-msp.jmapiproxy1.monster",
-          "base_url": "https://www.jmapinode.biz",
-          "is_cn": 0,
-          "cn_base_url": "https://www.jmapinode.biz",
-          "version": "1.6.0",
-          "test_version": "1.6.1",
-          "store_link": "https://play.google.com/store/apps/details?id=com.jiaohua_browser",
-          "ios_version": "1.6.0",
-          "ios_test_version": "1.6.1",
-          "ios_store_link": "https://18comic.vip/stray/",
-          "ad_cache_version": 1698140798,
-          "bundle_url": "https://18-comic.work/static/apk/patches1.6.0.zip",
-          "is_hot_update": true,
-          "api_banner_path": "https://cdn-msp.jmapiproxy1.monster/media/logo/channel_log.png?v=",
-          "version_info": "\nAPP & IOS更新\nV1.6.0\n#禁漫 APK 更新拉!!\n更新調整以下項目\n1. 系統優化\n\nV1.5.9\n1. 跳錯誤新增 重試 網頁 按鈕\n2. 圖片讀取優化\n3.
-          線路調整優化\n\n無法順利更新或是系統題是有風險請使用下方\n下載點2\n有問題可以到DC群反饋\nhttps://discord.gg/V74p7HM\n",
-          "app_shunts": [
-            {
-              "title": "圖源1",
-              "key": 1
-            },
-            {
-              "title": "圖源2",
-              "key": 2
-            },
-            {
-              "title": "圖源3",
-              "key": 3
-            },
-            {
-              "title": "圖源4",
-              "key": 4
-            }
-          ],
-          "download_url": "https://18-comic.work/static/apk/1.6.0.apk",
-          "app_landing_page": "https://jm365.work/pXYbfA",
-          "float_ad": true
-        }
+        禁漫app的setting请求
         """
         resp = self.req_api('/setting')
 
         # 检查禁漫最新的版本号
-        setting_ver = str(resp.model_data.version)
+        setting_ver = str(resp.model_data.jm3_version)
         # 禁漫接口的版本 > jmcomic库内置版本
-        if setting_ver > JmMagicConstants.APP_VERSION and JmModuleConfig.FLAG_USE_VERSION_NEWER_IF_BEHIND:
+        if (
+                JmModuleConfig.FLAG_USE_VERSION_NEWER_IF_BEHIND
+                and JmcomicText.compare_versions(setting_ver, JmMagicConstants.APP_VERSION) == 1
+        ):
             jm_log('api.setting', f'change APP_VERSION from [{JmMagicConstants.APP_VERSION}] to [{setting_ver}]')
             JmMagicConstants.APP_VERSION = setting_ver
 
@@ -848,15 +992,18 @@ class JmApiClient(AbstractJmClient):
             'password': password,
         })
 
+        res_data = resp.res_data
         cookies = dict(resp.resp.cookies)
-        cookies.update({'AVS': resp.res_data['s']})
+        cookies.update({'AVS': res_data['s']})
         self['cookies'] = cookies
+        self._username = username
+        self._user_id = str(res_data['uid']) if 'uid' in res_data else None
 
         return resp
 
     def favorite_folder(self,
                         page=1,
-                        order_by=JmMagicConstants.ORDER_BY_LATEST,
+                        order_by=JmMagicConstants.ORDER_FF_FAVORITE_TIME,
                         folder_id='0',
                         username='',
                         ) -> JmFavoritePage:
@@ -869,17 +1016,62 @@ class JmApiClient(AbstractJmClient):
             }
         )
 
-        return JmPageTool.parse_api_to_favorite_page(resp.model_data)
+        return JmPageTool.parse_api_to_favorite_page(resp.model_data, page)
 
-    def add_favorite_album(self,
-                           album_id,
-                           folder_id='0',
-                           ):
+    def album_comment(self,
+                      video_id,
+                      comment,
+                      originator='',
+                      status='true',
+                      comment_id=None,
+                      **kwargs,
+                      ) -> JmAlbumCommentResp:
+        raise NotImplementedError('移动端 API 不支持评论功能，请使用网页端 JmHtmlClient')
+
+    def album_pagination(self,
+                         jm_id: str,
+                         page=1,
+                         series=1,
+                         with_ad_wcm=1,
+                         need_total=True,
+                         ) -> JmAlbumCommentPage:
+        resp = self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+                'aid': JmcomicText.parse_to_jm_id(jm_id),
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    def forum_pagination(self,
+                         page=1,
+                         with_ad_wcm=1,
+                         ) -> JmAlbumCommentPage:
+        resp = self.req_api(
+            self.API_FORUM,
+            params={
+                'mode': 'all',
+                'page': page,
+            },
+        )
+        return JmPageTool.parse_api_to_album_comment_page(resp.model_data, page)
+
+    def toggle_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              expected_type: Optional[str] = None,
+                              ):
         """
-        移动端没有提供folder_id参数
+        切换本子的收藏状态（移动端接口底层为 Toggle 逻辑）。
+        :param album_id: 本子ID
+        :param folder_id: 移动端没有提供 folder_id 参数，保留参数兼容
+        :param expected_type: 期望的操作类型 ('add' | 'remove')，如果不匹配则抛异常
         """
         resp = self.req_api(
-            '/favorite',
+            self.API_FAVORITE,
+            get=False,
             data={
                 'aid': album_id,
             },
@@ -887,7 +1079,95 @@ class JmApiClient(AbstractJmClient):
 
         self.require_resp_status_ok(resp)
 
+        if expected_type is not None:
+            actual_type = resp.model_data.type
+            if actual_type != expected_type:
+                ExceptionTool.raises_resp(
+                    f'收藏操作不符合预期，期望 [{expected_type}]，实际为 [{actual_type}]: {resp.model_data.msg}',
+                    resp
+                )
+
         return resp
+
+    def add_favorite_album(self,
+                           album_id,
+                           folder_id='0',
+                           ):
+        """
+        把本子加入收藏夹。
+        如果当前已收藏，将抛出异常以保证收藏语义明确。
+        """
+        return self.toggle_favorite_album(album_id, folder_id, expected_type='add')
+
+    def delete_favorite_album(self,
+                              album_id,
+                              folder_id='0',
+                              ):
+        """
+        从收藏夹移除本子。
+        如果当前未收藏，将抛出异常以保证取消收藏语义明确。
+        """
+        return self.toggle_favorite_album(album_id, folder_id, expected_type='remove')
+
+    def get_daily(self,
+                  user_id: str | None = None,
+                  ) -> JmApiResp:
+        """
+        移动端获取每日签到信息与日历打卡记录。
+        返回值格式参考 JmUserClient.get_daily 文档。
+        :param user_id: 用户ID，默认读取当前登录用户的uid
+        :return: JmApiResp
+        """
+        if user_id is None:
+            ExceptionTool.require_true(self._user_id is not None, '签到需要传入 user_id 参数，或者先调用 login 方法')
+            user_id = self._user_id
+
+        return self.req_api(self.API_DAILY, params={'user_id': user_id})
+
+    def daily_checkin(self,
+                      daily_id: str | None = None,
+                      user_id: str | None = None,
+                      ) -> JmDailyCheckinResp:
+        """
+        执行每日打卡签到。
+        返回 JmDailyCheckinResp 对象：
+        - code=0 (或 status=0): 签到成功
+        - code=1 (或 status=1): 重复签到（今日已完成打卡）
+        - 其余失败情况直接抛出异常
+        :param daily_id: 打卡任务ID，未提供时会自动请求 get_daily 获取
+        :param user_id: 用户ID，默认读取当前登录用户的uid
+        :return: JmDailyCheckinResp
+        """
+        if user_id is None:
+            ExceptionTool.require_true(self._user_id is not None, '签到需要传入 user_id 参数，或者先调用 login 方法')
+            user_id = self._user_id
+
+        if daily_id is None:
+            daily_resp = self.get_daily(user_id)
+            if 'daily_id' not in daily_resp.res_data:
+                ExceptionTool.raises_resp('签到失败：签到信息缺少 daily_id', daily_resp)
+            daily_id = daily_resp.res_data['daily_id']
+
+        resp: JmApiResp = self.req_api(
+            self.API_DAILY_CHK,
+            get=False,
+            data={
+                'user_id': user_id,
+                'daily_id': daily_id,
+            },
+        )
+
+        res_data = resp.res_data
+        msg = str(res_data.get('msg', ''))
+
+        if any(kw in msg for kw in ('今天已經簽到過了', '已簽到', '簽到過', '已完成', '已签到')):
+            code = JmDailyCheckinResp.CODE_ALREADY_CHECKED_IN
+        elif 'Jcoin' in msg or 'EXP' in msg or res_data.get('status') == 'ok' or '成功' in msg:
+            code = JmDailyCheckinResp.CODE_SUCCESS
+        else:
+            ExceptionTool.raises_resp(f'签到失败：{msg or res_data}', resp)
+
+        return JmDailyCheckinResp(resp.resp, code, msg, res_data)
 
     # noinspection PyMethodMayBeStatic
     def require_resp_status_ok(self, resp: JmApiResp):
@@ -895,7 +1175,7 @@ class JmApiClient(AbstractJmClient):
         检查返回数据中的status字段是否为ok
         """
         data = resp.model_data
-        if data.status == 'ok':
+        if data.status != 'ok':
             ExceptionTool.raises_resp(data.msg, resp)
 
     def req_api(self, url, get=True, require_success=True, **kwargs) -> JmApiResp:
@@ -956,10 +1236,7 @@ class JmApiClient(AbstractJmClient):
 
         # 1. 检查是否 album_missing
         # json: {'code': 200, 'data': []}
-        data = resp.model().data
-        if isinstance(data, list) and len(data) == 0:
-            ExceptionTool.raise_missing(resp, JmcomicText.parse_to_jm_id(url))
-
+        # 最新api已不存在这种情况，无需检查
         # 2. 是否是特殊的内容
         # 暂无
 
@@ -967,9 +1244,6 @@ class JmApiClient(AbstractJmClient):
         """
         该方法会判断resp返回值是否是json格式，
         如果不是，大概率是禁漫内部异常，需要进行重试
-
-        由于完整的json格式校验会有性能开销，所以只做简单的检查，
-        只校验第一个有效字符是不是 '{'，如果不是，就认为异常数据，需要重试
         """
         resp = super().raise_if_resp_should_retry(resp, is_image)
 
@@ -989,22 +1263,20 @@ class JmApiClient(AbstractJmClient):
             # /chapter_view_template 这个接口不是返回json数据，不做检查
             return resp
 
-        text = resp.text
-        for char in text:
-            if char not in (' ', '\n', '\t'):
-                # 找到第一个有效字符
-                ExceptionTool.require_true(
-                    char == '{',
-                    f'请求不是json格式，强制重试！响应文本: [{resp.text}]'
-                )
-                return resp
-
-        ExceptionTool.raises_resp(f'响应无数据！request_url=[{url}]', resp)
+        try:
+            JmcomicText.try_parse_json_object(resp.text)
+            return resp
+        except Exception:
+            ExceptionTool.raises_resp(
+                f'请求不是json格式，强制重试！响应文本: [{JmcomicText.limit_text(resp.text, 200)}]',
+                resp,
+            )
 
     def after_init(self):
         # 自动更新禁漫API域名
         if JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN:
-            self.update_api_domain()
+            new_server_list = self.fetch_latest_api_domain_for_module()
+            self.update_old_api_domain(new_server_list)
 
         # 保证拥有cookies，因为移动端要求必须携带cookies，否则会直接跳转同一本子【禁漫娘】
         if JmModuleConfig.FLAG_API_CLIENT_REQUIRE_COOKIES:
@@ -1029,13 +1301,19 @@ class JmApiClient(AbstractJmClient):
         else:
             return res_data['Server']
 
-    def update_api_domain(self):
-        if True is JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN_DONE:
-            return
+    def update_old_api_domain(self, new_server_list: List[str]):
+        if new_server_list and sorted(self.domain_list) == sorted(JmModuleConfig.DOMAIN_API_LIST):
+            self.domain_list = new_server_list
+
+    def fetch_latest_api_domain_for_module(self):
+        if JmModuleConfig.DOMAIN_API_UPDATED_LIST is not None:
+            return JmModuleConfig.DOMAIN_API_UPDATED_LIST
 
         with self.client_update_domain_lock:
-            if True is JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN_DONE:
-                return
+            # double check
+            if JmModuleConfig.DOMAIN_API_UPDATED_LIST is not None:
+                return JmModuleConfig.DOMAIN_API_UPDATED_LIST
+
             # 遍历多个域名服务器
             for url in JmModuleConfig.API_URL_DOMAIN_SERVER_LIST:
                 try:
@@ -1047,18 +1325,20 @@ class JmApiClient(AbstractJmClient):
                     jm_log('api.update_domain.success',
                            f'获取到最新的API域名，替换jmcomic内置域名：(new){new_server_list} ---→ (old){old_server_list}'
                            )
-                    # 更新域名
-                    if sorted(self.domain_list) == sorted(old_server_list):
-                        self.domain_list = new_server_list
-                    JmModuleConfig.DOMAIN_API_LIST = new_server_list
-                    break
+                    JmModuleConfig.DOMAIN_API_UPDATED_LIST = new_server_list
+                    return new_server_list
                 except Exception as e:
                     jm_log('api.update_domain.error',
-                           f'通过[{url}]自动更新API域名失败，仍使用jmcomic内置域名。'
+                           f'通过[{url}]自动更新API域名失败，尝试下一个地址。'
                            f'可通过代码[JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN=False]关闭自动更新API域名. 异常： {e}'
                            )
-            # set done finally
-            JmModuleConfig.FLAG_API_CLIENT_AUTO_UPDATE_DOMAIN_DONE = True
+                    continue
+
+            # 走到这里，说明没有获取到域名更新
+            # 为了本方法不被重复执行，把新域名字段修改为空列表
+            # 空列表相当于一个done标识
+            JmModuleConfig.DOMAIN_API_UPDATED_LIST = []
+            return JmModuleConfig.DOMAIN_API_UPDATED_LIST
 
     client_init_cookies_lock = Lock()
 
@@ -1170,13 +1450,14 @@ class PhotoConcurrentFetcherProxy(JmcomicClient):
 
             # after future done, remove it from future_dict.
             # cache depends on self.client instead of self.future_dict
-            future = self.FutureWrapper(self.executors.submit(task),
+            future = self.FutureWrapper(self.executors.submit(bind_jm_task_context(task)),
                                         after_done_callback=lambda: self.future_dict.pop(cache_key, None)
                                         )
 
             self.future_dict[cache_key] = future
             return future
 
+    # noinspection PyTypeChecker
     def get_photo_detail(self, photo_id, fetch_album=True, fetch_scramble_id=True) -> JmPhotoDetail:
         photo_id = JmcomicText.parse_to_jm_id(photo_id)
         client: JmcomicClient = self.client
@@ -1212,6 +1493,7 @@ class PhotoConcurrentFetcherProxy(JmcomicClient):
         for i, f in enumerate(futures):
             if f is None:
                 continue
+            # noinspection PyUnresolvedReferences
             results[i] = f.result()
 
         # compose
@@ -1225,3 +1507,6 @@ class PhotoConcurrentFetcherProxy(JmcomicClient):
             photo.scramble_id = scramble_id
 
         return photo
+
+    def __getattr__(self, item):
+        return getattr(self.client, item)
